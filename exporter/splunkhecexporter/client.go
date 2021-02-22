@@ -20,10 +20,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/sync/errgroup"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 
 	"go.opentelemetry.io/collector/component"
@@ -116,16 +118,81 @@ func (c *client) pushTraceData(
 }
 
 func (c *client) sendSplunkEvents(ctx context.Context, splunkEvents []*splunk.Event) error {
-	body, compressed, err := encodeBodyEvents(&c.zippers, splunkEvents, c.config.DisableCompression)
-	if err != nil {
-		return consumererror.Permanent(err)
+	if len(splunkEvents) == 0 {
+		return c.sendSplunkEventsHelper(ctx, new(bytes.Buffer), false)
 	}
 
+	bbuf := bytes.NewBuffer(make([]byte, 0, c.config.MaxContentLength))
+	gbuf := bytes.NewBuffer(make([]byte, 0, c.config.MaxContentLength))
+
+	gwriter := c.zippers.Get().(*gzip.Writer)
+	gwriter.Reset(gbuf)
+	defer func() {
+		gwriter.Close()
+		c.zippers.Put(gwriter)
+	}()
+
+	ebuf := new(bytes.Buffer)
+	enc := json.NewEncoder(ebuf)
+
+	grp, ctx := errgroup.WithContext(ctx)
+
+	lensub1 := len(splunkEvents) - 1
+
+	for i, event := range splunkEvents {
+		if err := enc.Encode(event); err != nil {
+			return consumererror.Permanent(err)
+		}
+		ebuf.WriteString("\r\n\r\n")
+
+		if bbuf.Len()+ebuf.Len() <= c.config.MaxContentLength {
+			if _, err := ebuf.WriteTo(bbuf); err != nil {
+				return consumererror.Permanent(err)
+			}
+			if i < lensub1 {
+				continue
+			}
+		}
+
+		// TODO: limit the number of concurrent connections
+		if bbuf.Len() <= 1500 || c.config.DisableCompression {
+			bbufcopy := bbuf
+
+			c.wg.Add(1)
+			grp.Go(func() error {
+				defer c.wg.Done()
+				return c.sendSplunkEventsHelper(ctx, bbufcopy, false)
+			})
+		} else {
+			if _, err := gwriter.Write(bbuf.Bytes()); err != nil {
+				return consumererror.Permanent(err)
+			}
+
+			gwriter.Flush()
+			gbufcopy := gbuf
+
+			c.wg.Add(1)
+			grp.Go(func() error {
+				defer c.wg.Done()
+				return c.sendSplunkEventsHelper(ctx, gbufcopy, true)
+			})
+		}
+
+		bbuf = bytes.NewBuffer(make([]byte, 0, c.config.MaxContentLength))
+		gbuf = bytes.NewBuffer(make([]byte, 0, c.config.MaxContentLength))
+		gwriter.Reset(gbuf)
+	}
+
+	return grp.Wait()
+}
+
+func (c *client) sendSplunkEventsHelper(ctx context.Context, body io.Reader, compressed bool) error {
 	req, err := http.NewRequestWithContext(ctx, "POST", c.url.String(), body)
 	if err != nil {
 		return consumererror.Permanent(err)
 	}
 
+	req.Header.Set("Content-Length", strconv.FormatInt(req.ContentLength, 10))
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
